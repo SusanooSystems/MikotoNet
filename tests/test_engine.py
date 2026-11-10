@@ -119,9 +119,11 @@ class EngineTests(unittest.TestCase):
             self.finalize(n, (a,))
             b = n.graph.insert(self.vertex(1, parents=(a,), txs=(self.tx(1, side="buy", price=6, quantity=1),)))
             self.finalize(n, (b,))
+            n.close()
             restored = Node("test", self.validators, self.balances, path)
             self.assertEqual(restored.exchange.root, n.exchange.root)
             self.assertEqual(restored.head, n.head)
+            restored.close()
             with self.assertRaises(ValueError):
                 Node("another-chain", self.validators, self.balances, path)
             path.write_bytes(path.read_bytes()[:-1])

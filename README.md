@@ -21,6 +21,40 @@ It prints actual fills, balances and a SHA-256 state commitment. No keys or
 funds from an external chain are used. Prices and quantities are positive integer
 atomic units: `price * quantity` is QUOTE cost; market scaling is caller-defined.
 
+## Four-validator network
+
+```sh
+python3 -m mikotonet.devnet /tmp/mikoto-devnet
+```
+
+The generator prints four commands. Run each in a separate terminal, for example:
+
+```sh
+python3 -m mikotonet.network /tmp/mikoto-devnet/node0.json
+```
+
+Run the other three configs the same way. The generated signed ask/bid vertices
+are startup fixtures; nodes gossip them, collect three checkpoint signatures,
+fsync their journals and replicate the same fill and state root. Each process
+has its own Ed25519 key, vote locks, vertex log and checkpoint journal. The
+installed equivalent is `mikotonet-node CONFIG.json`. Stop with Ctrl-C and
+restart using the same config and data files. The generator refuses to overwrite
+an existing directory and writes development private keys with mode 0600.
+
+Configuration contains `chain`, `balances`, `peers` (public-key to `[host, port]`),
+`key_file` (hex Ed25519 seed), `journal`, and optional `vertex_files` containing
+signed vertex JSON. All validators must share the same chain, peer key set and
+genesis balances. For separate hosts, configure reachable peer addresses and
+separate local key/journal paths. Never copy a validator key into two running
+validators. Use private networking or an encrypted tunnel: wire messages are
+signed, but are not encrypted.
+
+The library exposes authenticated `status`, `vertices`, `vote`, `finalize` and
+one-checkpoint-at-a-time `sync` RPCs through `Peer.rpc`. Only allowlisted validator
+keys can call these operations. New signed vertices can be sent with `vertices`;
+the network does not hold account keys or manufacture user orders. There is no
+public trading HTTP API.
+
 ## Minimal scope
 
 - One BASE/QUOTE spot market with deterministic price-time priority, maker-price
@@ -33,7 +67,7 @@ atomic units: `price * quantity` is QUOTE cost; market scaling is caller-defined
   `floor(2N/3)+1` distinct allowlisted validator signatures (minimum four validators).
   Certificates bind genesis, previous checkpoint, height, tips, exact vertex
   order and pre/post execution state roots including receipts and fills.
-- Optional append-only JSONL journal: `Node(chain, validators, balances, path)`.
+- Append-only JSONL checkpoint journal: `Node(chain, validators, balances, path)`.
   Checkpoints are flushed and fsynced before applying/acknowledging. Restart
   re-verifies signatures and re-executes the certified history. Corrupt, foreign
   or truncated records fail closed; storage write failures require a restart.
@@ -63,34 +97,67 @@ Finality here is explicit permissioned checkpoint certification. Accounts need
 only one Ed25519 signature per transaction; validators each sign the checkpoint.
 This is not threshold cryptography or proof of stake.
 
+## Networking and crash-safe voting
+
+TCP frames have a 4 MiB limit, five-second session timeout and 32 concurrent
+inbound-session limit. Every connection uses a fresh server challenge. The
+request signature binds challenge, intended recipient, genesis and operation;
+the response is signed by the expected peer and binds the exact request digest.
+Replay on a new connection, unknown peers, foreign genesis and altered content
+are rejected. Signatures authenticate payloads; they do not hide their contents.
+
+The leader is `sorted(validator_keys)[current_height % N]`. The leader requests
+votes, validates the resulting quorum certificate locally, commits it, then
+broadcasts it. Followers independently reconstruct ordering and execution roots
+before signing. Restarted or disconnected nodes pull and verify missing
+certificates. Unfinalized vertices are persisted and re-gossiped. A restarted
+leader retries its original durably locked proposal, even if new vertices arrived.
+
+With a journal configured, a signed checkpoint vote is fsynced to a separate
+vote log **before the signature is returned or sent**. Recovery checks the saved
+signature and full checkpoint and restores the `(validator, height)` lock. A
+conflicting digest at that height is refused, including after abrupt process
+exit. A storage failure disables further signing until restart; incomplete logs
+fail closed. File and directory fsync protect new log entries and filenames.
+An OS advisory lock prevents two node processes from sharing the same journal.
+Without a journal, the original in-memory demo remains intentionally ephemeral;
+network validators require a journal.
+
 ## Trust and operating limits
 
-This is a single-process, single-writer reference node with library APIs and a
-local demo, not a deployed exchange or a complete networked BFT protocol. There
-is no P2P transport, HTTP service, UI, leader/view-change protocol, synchronization
-service, wall-clock expiry, external price feed or performance claim.
+This is a minimal permissioned network implementation, not a complete
+production BFT protocol. Each node runs one event loop and one storage writer.
+There is no timeout-based view change: losing the designated leader stalls that
+height. A Byzantine leader that splits votes across proposals can also stall
+progress. Do not clear vote locks to regain liveness. There is no automatic
+membership change, fork resolution, snapshot/compaction service, wall-clock
+expiry or performance/WAN claim. Quorum safety assumes fewer than one third
+Byzantine validators, intact durable vote locks and uncompromised keys.
 
-The local `vote` helper refuses conflicting votes at the same height during its
-process lifetime. **Vote locks are not durable across restart**. Independent
-validators would require durable signing locks, authenticated transport, a
-proposal/locking/view-change protocol and fault testing before any distributed
-safety or liveness claim. Keys are supplied by callers; production key custody
-is not provided. Quorum verification assumes honest validators do not sign
-conflicting checkpoints. Conflicting certificates are not resolved by fork choice.
+Keep the key, checkpoint journal, `.votes`, `.vertices` and `.lock` files together
+on trusted POSIX local storage. Whole-directory deletion/rollback and cloned
+keys are outside the crash model; retain an external trusted checkpoint if
+rollback detection is needed. Do not edit a truncated log to resume signing
+without authoritative recovery. Account and validator key custody is caller-owned.
 
-The journal path must be on trusted local storage and have exactly one writer;
-pre-create its parent directory. Directory creation durability, cross-process
-locking, compaction, snapshots and protection from whole-file rollback/deletion
-are not implemented. Unfinalized vertices are volatile. Keep an external trusted
-head/genesis if rollback detection is required. History, fills and receipts grow
-in memory; graph and order caps are development bounds, not a production resource
-budget. Invalid signed business operations produce deterministic rejection
-receipts and leave balances/nonces unchanged. Graph admission rejects malformed
-or unauthenticated transactions before certification.
+History, fills, receipts and ancestor sets grow in memory. Graph/order caps and
+the 1,024-vertex gossip bundle limit are development bounds, not a production
+resource budget. A checkpoint and its fresh vertices must fit a wire frame;
+large-batch fragmentation is not implemented. Invalid signed business operations
+produce deterministic rejection receipts and leave balances/nonces unchanged.
+Malformed or unauthenticated transactions are rejected before certification.
 
 ## Source map
 
 `mikotonet/engine.py` contains canonical encoding, signatures, graph validation,
-spot execution, checkpoints and recovery. `mikotonet/demo.py` is the runnable
+spot execution, checkpoints and recovery. `storage.py` owns sync writes and writer
+locks; `network.py` owns the authenticated TCP service and replication loop;
+`devnet.py` generates a runnable four-node local deployment. `mikotonet/demo.py` is the runnable
 example. `tests/test_engine.py` covers graph invariants, admission, deterministic
 ordering, matching, conservation, rejection atomicity, quorum, replay and recovery.
+Network tests cover authentication, replay, frame limits, leader restrictions,
+quorum loss, restart catch-up and durable proposal retry. A separate integration
+test launches four actual node processes, finalizes a funded trade, stops them
+and verifies equal recovered state. Crash-vote testing uses abrupt process exit;
+fsync failure and concurrent writers are also tested. These are loopback results,
+not evidence of geographically distributed deployment.

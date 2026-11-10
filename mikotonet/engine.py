@@ -4,9 +4,9 @@ from __future__ import annotations
 import hashlib
 import copy
 import json
-import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from .storage import WriterLock, append, records
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
@@ -231,7 +231,7 @@ class Exchange:
 
 
 class Node:
-    """Single-writer local replica; certificates finalize entire ancestor closures."""
+    """Single-writer replica with optional durable checkpoint and signing journals."""
     def __init__(self, chain, validators, balances, journal=None):
         if len(set(validators)) != len(validators) or len(validators) < 4:
             raise ValueError("need at least four distinct validators")
@@ -243,16 +243,40 @@ class Node:
         self.journal = Path(journal) if journal else None
         self.failed = False
         self.voted = {}
-        if self.journal and self.journal.exists():
-            for line in self.journal.read_bytes().splitlines(keepends=True):
-                if not line.endswith(b"\n"):
-                    raise ValueError("truncated journal; restore before continuing")
-                record = json.loads(line)
+        self.vote_checkpoints = {}
+        self._lock = WriterLock(str(self.journal) + ".lock") if self.journal else None
+        try:
+            self._recover()
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        if self._lock:
+            self._lock.close()
+        self.failed = True
+
+    def _recover(self):
+        if self.journal:
+            for record in records(self.journal):
                 for raw in record["vertices"]:
                     raw["parents"] = tuple(raw["parents"])
                     raw["transactions"] = tuple(Transaction(**t) for t in raw["transactions"])
                     self.graph.insert(Vertex(**raw))
                 self.finalize(record["checkpoint"], record["votes"], persist=False)
+            for record in records(str(self.journal) + ".votes"):
+                if record["genesis"] != self.genesis or record["author"] not in self.graph.validators:
+                    raise ValueError("foreign vote journal")
+                verify(record["author"], record["signature"], bytes.fromhex(record["message"]))
+                # The signature binds the entire checkpoint, including its height.
+                cp = record["checkpoint"]
+                if cp["genesis"] != self.genesis or digest("mikoto/checkpoint/v1", cp) != record["message"]:
+                    raise ValueError("corrupt vote journal")
+                slot = (record["author"], cp["height"])
+                if slot in self.voted and self.voted[slot] != record["message"]:
+                    raise ValueError("conflicting vote journal")
+                self.voted[slot] = record["message"]
+                self.vote_checkpoints[slot] = cp
 
     def propose(self, tips):
         ordered = self.graph.ordered(tips)
@@ -266,14 +290,25 @@ class Node:
                 "post_state": preview.root}
 
     def vote(self, key, checkpoint):
+        if self.failed:
+            raise ValueError("storage failure or closed node; restart required")
         if public(key) not in self.graph.validators or checkpoint != self.propose(tuple(checkpoint["tips"])):
             raise ValueError("invalid proposal")
         message = digest("mikoto/checkpoint/v1", checkpoint)
         slot = checkpoint["height"]
         if (public(key), slot) in self.voted and self.voted[public(key), slot] != message:
             raise ValueError("conflicting local vote")
+        signature = key.sign(bytes.fromhex(message)).hex()
+        if self.journal and (public(key), slot) not in self.voted:
+            try:
+                append(str(self.journal) + ".votes", {"genesis": self.genesis, "author": public(key),
+                       "message": message, "checkpoint": checkpoint, "signature": signature})
+            except OSError:
+                self.failed = True
+                raise
         self.voted[public(key), slot] = message
-        return key.sign(bytes.fromhex(message)).hex()
+        self.vote_checkpoints[public(key), slot] = copy.deepcopy(checkpoint)
+        return signature
 
     def finalize(self, checkpoint, votes, persist=True):
         if self.failed:
@@ -294,10 +329,7 @@ class Node:
             record = {"checkpoint": checkpoint, "votes": votes,
                       "vertices": [asdict(self.graph.vertices[i]) for i in fresh]}
             try:
-                with self.journal.open("ab") as handle:
-                    handle.write(canonical(record) + b"\n")
-                    handle.flush()
-                    os.fsync(handle.fileno())
+                append(self.journal, record)
             except OSError:
                 self.failed = True
                 raise
